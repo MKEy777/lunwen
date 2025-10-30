@@ -92,8 +92,7 @@ class NumericalEEGDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.features[idx], self.labels[idx]
 
-# ... custom_weight_init, train_epoch, evaluate_model, build_filename_prefix, plot_history, save_model_torch ...
-# ... 这些函数都保持不变 ...
+
 def custom_weight_init(m: nn.Module):
     if isinstance(m, SpikingDense) and m.kernel is not None:
         input_dim = m.kernel.shape[0];
