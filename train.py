@@ -1,5 +1,3 @@
-# 文件名: CSNN_depthwise_random_split.py
-
 import os
 import glob
 import numpy as np
@@ -21,7 +19,7 @@ import copy
 # 从模型文件中导入我们需要的模块
 from model.TTFS import SNNModel, SpikingDense, DivisionFreeAnnToSnnEncoder
 
-# --- 【修改1】添加深度可分离卷积模块的定义 ---
+# --- 【模块1】深度可分离卷积 (保持不变) ---
 class DepthwiseSeparableConv(nn.Module):
     """
     支持步长的深度可分离卷积模块。
@@ -34,6 +32,73 @@ class DepthwiseSeparableConv(nn.Module):
     def forward(self, x):
         return self.pointwise(self.depthwise(x))
 
+# --- 【新增模块1】FPGA友好的 Hard-Sigmoid (最终修正版 - 除以8) ---
+class HardSigmoid(nn.Module):
+    def __init__(self, inplace=False):
+        super(HardSigmoid, self).__init__()
+
+    def forward(self, x):
+        # 实现 clip(x / 8 + 0.5, 0, 1)
+        # x * 0.125 (除以8) 在 FPGA 上是高效的位移操作
+        return torch.clamp(x * 0.125 + 0.5, 0.0, 1.0)
+
+# --- 【新增模块2】超轻量级门控块 (Ultra-Lightweight Gated Block) ---
+class UltraLightweightGatedBlock(nn.Module):
+    """
+    主路径(DWConv) * 通道门(AvgPool+Conv1d) * 空间门(Mean+Conv2d)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super().__init__()
+        if in_channels != out_channels:
+            raise ValueError("此轻量块的输入和输出通道必须相同。")
+        
+        padding = (kernel_size - 1) // 2
+        
+        # 主路径: 仅 DepthwiseConv
+        self.main_path = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, stride=1, padding=padding, groups=in_channels)
+        )
+        
+        # 通道门控路径
+        self.channel_gate_path = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), # (B, C, 1, 1)
+            nn.Conv2d(in_channels, in_channels, kernel_size=1), # 等效于 Linear(C, C)
+            HardSigmoid()
+        )
+        
+        # 空间门控路径
+        self.spatial_gate_path = nn.Sequential(
+            # 输入将是 (B, 1, H, W)
+            nn.Conv2d(1, 1, kernel_size=kernel_size, stride=1, padding=padding),
+            HardSigmoid()
+        )
+            
+        # 最终的 BN 和 ReLU
+        self.final_act = nn.Sequential(
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        # 主路径 (B, C, H, W)
+        main_out = self.main_path(x)
+        
+        # 通道门 (B, C, 1, 1)
+        channel_gate = self.channel_gate_path(x)
+        
+        # 空间门 (B, 1, H, W)
+        # 1. 计算通道均值
+        spatial_in = torch.mean(x, dim=1, keepdim=True)
+        # 2. 计算空间权重
+        spatial_gate = self.spatial_gate_path(spatial_in)
+        
+        # 融合: 主路径 * 通道门 * 空间门
+        fused = main_out * channel_gate * spatial_gate
+        
+        # 最终激活
+        return self.final_act(fused)
+
+
 # --- 核心配置 ---
 FEATURE_DIR = r"Feature_PowerSpectrumEntropy_LDS_Smoothed_4x8x9_AllData" 
 TEST_SPLIT_SIZE = 0.2
@@ -43,14 +108,14 @@ T_MIN_INPUT = 0.0
 T_MAX_INPUT = 1.0
 RANDOM_SEED = 42
 TRAINING_GAMMA = 10.0
-NUM_EPOCHS = 300
+NUM_EPOCHS = 100
 EARLY_STOPPING_PATIENCE = 30
 EARLY_STOPPING_MIN_DELTA = 0.0001
 
-# --- 超参数网格 ---
+# --- 超参数网格 (适配 4->8->8 结构) ---
 hyperparameter_grid = {
     'LEARNING_RATE': [5e-4],
-    'CONV_CHANNELS': [[8, 16]], 
+    'CONV_CHANNELS': [[8, 8]],  # 块1输出通道(8), 块2输出通道(8)
     'LAMBDA_L2': [0],
     'DROPOUT_RATE': [0],
     'BATCH_SIZE': [8],
@@ -149,6 +214,7 @@ def evaluate_model(model: SNNModel, dataloader: DataLoader, criterion: nn.Module
             total_samples += labels.size(0); all_labels.extend(labels.cpu().numpy()); all_preds.extend(predicted.cpu().numpy())
     return running_loss / total_samples, correct_predictions / total_samples, all_labels, all_preds
 
+# --- 【修改】更新文件名以反映新结构 ---
 def build_filename_prefix(params: Dict[str, Any]) -> str:
     h1, h2 = params.get('HIDDEN_UNITS_1', 'h1NA'), params.get('HIDDEN_UNITS_2', 'h2NA')
     lr, bs = params.get('LEARNING_RATE', 'lrNA'), params.get('BATCH_SIZE', 'bsNA')
@@ -157,7 +223,7 @@ def build_filename_prefix(params: Dict[str, Any]) -> str:
     else: channels_to_join = conv_channels_list
     conv_ch_str = "-".join(map(str, channels_to_join)); conv_k = params.get('CONV_KERNEL_SIZE', 'kNA')
     lr_str = f"{lr:.0e}".replace('e-0', 'e-'); dp_rate = params.get('DROPOUT_RATE', 'dpNA')
-    l2_lambda = params.get('LAMBDA_L2', 'l2NA'); return f"SNN_dsc_conv{conv_ch_str}_h{h1}-{h2}_lr{lr_str}_bs{bs}_dp{dp_rate}_l2_{l2_lambda}"
+    l2_lambda = params.get('LAMBDA_L2', 'l2NA'); return f"SNN_dsc-ulgate_conv{conv_ch_str}_h{h1}-{h2}_lr{lr_str}_bs{bs}_dp{dp_rate}_l2_{l2_lambda}"
 
 def plot_history(*args, **kwargs):
     train_losses, val_losses, train_accuracies, val_accuracies, train_lrs, filename_prefix, save_dir, stopped_epoch = args; epochs_range = range(1, len(train_losses) + 1)
@@ -165,13 +231,13 @@ def plot_history(*args, **kwargs):
     plt.subplot(1, 3, 1); plt.plot(epochs_range, train_losses, 'bo-', label='Training Loss'); plt.plot(epochs_range, val_losses, 'ro-', label='Validation Loss'); plt.title(f'Loss Curve{title_suffix}'); plt.xlabel('Epoch'); plt.ylabel('Loss'); plt.legend(); plt.grid(True)
     plt.subplot(1, 3, 2); plt.plot(epochs_range, train_accuracies, 'bo-', label='Training Accuracy'); plt.plot(epochs_range, val_accuracies, 'ro-', label='Validation Accuracy'); plt.title(f'Accuracy Curve{title_suffix}'); plt.xlabel('Epoch'); plt.ylabel('Accuracy'); plt.legend(); plt.grid(True)
     plt.subplot(1, 3, 3); plt.plot(epochs_range, train_lrs, 'go-', label='Learning Rate'); plt.title(f'Learning Rate Curve{title_suffix}'); plt.xlabel('Epoch'); plt.ylabel('Learning Rate'); plt.legend(); plt.grid(True); plt.yscale('log')
-    plt.tight_layout(); timestamp = time.strftime("%Y%m%d_%H%M%S"); filename = os.path.join(save_dir, f"training_history_and_lr_{filename_prefix}_{timestamp}.png")
+    plt.tight_layout(); timestamp = time.strftime("%Y%m%d_%HM%S"); filename = os.path.join(save_dir, f"training_history_and_lr_{filename_prefix}_{timestamp}.png")
     plt.savefig(filename); plt.close(); print(f"训练历史和学习率图已保存为: {filename}")
 
 def save_model_torch(*args, **kwargs):
     model, filename_prefix, save_dir = args
     if not os.path.exists(save_dir): os.makedirs(save_dir, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d_%H%M%S"); save_path = os.path.join(save_dir, f"模型_{filename_prefix}_{timestamp}.pth")
+    timestamp = time.strftime("%Y%m%d_%HM%S"); save_path = os.path.join(save_dir, f"模型_{filename_prefix}_{timestamp}.pth")
     torch.save(model.state_dict(), save_path); print(f"模型成功保存至: {save_path}")
 
 # --- 主训练流程 ---
@@ -183,7 +249,7 @@ def run_training_session(current_hyperparams: Dict, fixed_params_dict: Dict, run
     all_params['LEARNING_RATE'], all_params['BATCH_SIZE'], all_params['CONV_CHANNELS'], all_params['CONV_KERNEL_SIZE'], all_params['HIDDEN_UNITS_1'], all_params['HIDDEN_UNITS_2'], all_params['DROPOUT_RATE'], all_params.get('LAMBDA_L2', 0), all_params['NUM_EPOCHS'], all_params['TRAINING_GAMMA'], all_params['EARLY_STOPPING_PATIENCE'], all_params['EARLY_STOPPING_MIN_DELTA'], all_params['T_MIN_INPUT'], all_params['T_MAX_INPUT'])
 
     # --- 2. 路径与日志 ---
-    run_timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_timestamp = time.strftime("%Y%m%d_%HM%S")
     base_prefix_for_dir = build_filename_prefix(all_params)
     run_specific_output_dir_name = f"{base_prefix_for_dir}_{run_timestamp}"
     run_specific_output_dir = os.path.join(all_params['OUTPUT_DIR_BASE'], run_specific_output_dir_name)
@@ -218,25 +284,49 @@ def run_training_session(current_hyperparams: Dict, fixed_params_dict: Dict, run
     train_loader = DataLoader(train_dataset, batch_size=all_params['BATCH_SIZE'], shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=all_params['BATCH_SIZE'], shuffle=False, num_workers=0)
 
-    # --- 5. 模型构建 ---
+    # --- 【修改】模型构建 (采用 DSC -> Ultra-Lightweight Gate 结构) ---
     model = SNNModel()
     in_channels = 4
     ann_layers = []
-    strides = [1, 2] 
     
-    # 【修改2】在模型构建中用 DepthwiseSeparableConv 替换 nn.Conv2d
-    for i, out_channels in enumerate(CONV_CHANNELS_CONFIG):
-        ann_layers.extend([
-            DepthwiseSeparableConv(
-                in_channels, 
-                out_channels, 
-                kernel_size=CONV_KERNEL_SIZE_PARAM, 
-                stride=strides[i]
-            ),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        ])
-        in_channels = out_channels
+    if not CONV_CHANNELS_CONFIG or len(CONV_CHANNELS_CONFIG) != 2:
+        raise ValueError(f"CONV_CHANNELS_CONFIG 必须是一个包含两个通道数的列表, e.g., [8, 8], 但收到了: {CONV_CHANNELS_CONFIG}")
+        
+    out_channels_1 = CONV_CHANNELS_CONFIG[0] # e.g., 8
+    out_channels_2 = CONV_CHANNELS_CONFIG[1] # e.g., 8
+
+    if out_channels_1 != out_channels_2:
+        raise ValueError(f"CONV_CHANNELS_CONFIG 的两个值必须相同 ({out_channels_1} vs {out_channels_2}) "
+                         "以便 UltraLightweightGatedBlock 能够运行。")
+
+    # 块 1: DepthwiseSeparableConv (无残差, 下采样)
+    # 输入 4, 输出 8, 步长 2
+    ann_layers.extend([
+        DepthwiseSeparableConv(
+            in_channels, 
+            out_channels_1, 
+            kernel_size=CONV_KERNEL_SIZE_PARAM, 
+            stride=2 # stride 2
+        ),
+        nn.BatchNorm2d(out_channels_1),
+        nn.ReLU(inplace=True)
+    ])
+    
+    # 更新 in_channels 为上一块的输出
+    in_channels = out_channels_1 # 8
+
+    # 块 2: UltraLightweightGatedBlock (带门控, s=1)
+    # 输入 8, 输出 8, 步长 1
+    ann_layers.append(
+        UltraLightweightGatedBlock(
+            in_channels, 
+            out_channels_2, 
+            kernel_size=CONV_KERNEL_SIZE_PARAM
+        )
+    )
+    # (BN 和 ReLU 已经包含在块内部)
+    
+    # --- 【修改结束】---
     
     model.add(nn.Sequential(*ann_layers))
     
@@ -246,7 +336,7 @@ def run_training_session(current_hyperparams: Dict, fixed_params_dict: Dict, run
         dummy_output = cnn_part(dummy_input)
         flattened_dim = dummy_output.numel()
     
-    print(f"Hybrid model (Depthwise Separable Conv) created. Flattened dimension before SNN: {flattened_dim}")
+    print(f"Hybrid model (DSC -> Ultra-Lightweight Gate) created. Flattened dimension before SNN: {flattened_dim}")
 
     model.add(DivisionFreeAnnToSnnEncoder(t_min=T_MIN_INPUT, t_max=T_MAX_INPUT))
     model.add(nn.Flatten())
@@ -360,7 +450,7 @@ if __name__ == "__main__":
         print(f"Best overall validation accuracy: {best_accuracy_overall:.4f}")
         print(f"Best hyperparameter combination: {json.dumps(best_hyperparams_combo_overall, indent=2)}")
         
-        summary_file_path = os.path.join(OUTPUT_DIR_BASE, f"grid_search_summary_{time.strftime('%Y%m%d_%H%M%S')}.json")
+        summary_file_path = os.path.join(OUTPUT_DIR_BASE, f"grid_search_summary_{time.strftime('%Y%m%d_%HM%S')}.json")
         summary_data = {
             "best_overall_validation_accuracy": best_accuracy_overall,
             "best_hyperparameters": best_hyperparams_combo_overall,
